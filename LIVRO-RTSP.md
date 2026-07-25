@@ -220,20 +220,62 @@ static (string Id, int? TimeoutSec) ParseSession(string value)
 
 ### 3.2 Range e tempos
 
-A implementação precisa suportar pelo menos os formatos necessários ao recurso negociado em `Accept-Ranges`.
+A header `Range` diz **qual trecho temporal da mídia** o cliente quer reproduzir/controlar.  
+Sem `Range`, em muitos cenários o servidor usa o ponto atual da sessão (pause point).
+
+No RTSP 2.0, tempo de mídia pode aparecer em formatos diferentes (por exemplo `npt`, `clock`, `smpte`), e o suporte é negociado/indicado por `Accept-Ranges`.
+
+#### O que é NPT
+
+`NPT` (**Normal Play Time**) é o formato mais comum e representa tempo relativo da apresentação, em segundos.
+
+Exemplos:
+
+- `Range: npt=10-30` -> toca do segundo 10 ao 30;
+- `Range: npt=10-` -> toca do segundo 10 até o fim (ou até novo controle);
+- `Range: npt=-30` -> sem início explícito, com fim no segundo 30 (semântica depende do contexto/método);
+- `Range: npt=now-` -> em conteúdo live/time-progressing, começa no "agora".
+
+#### Por que `Range` é importante
+
+1. controle fino de seek e retomada;
+2. interoperabilidade entre cliente/servidor sobre o tempo efetivo entregue;
+3. tratamento correto de erro (`457 Invalid Range`) quando o trecho pedido é inválido.
+
+Em respostas de `PLAY`/`PAUSE`, o servidor pode devolver um `Range` ajustado para refletir o trecho real que será/foi entregue.
 
 ### Snippet C#: parser simples de `Range: npt=start-stop`
 
 ```csharp
+// Estrutura imutável para transportar o resultado do parse.
+// Start e Stop são opcionais (null quando não vierem no Range).
 public readonly record struct NptRange(double? Start, double? Stop);
 
 static NptRange ParseNpt(string rangeValue)
 {
-    // Espera "npt=10-30", "npt=10-", "npt=-30"
+    // Espera formatos como:
+    // "npt=10-30", "npt=10-", "npt=-30"
+    // Remove o prefixo "npt=" e guarda só "10-30", "10-", "-30".
     var raw = rangeValue["npt=".Length..];
+
+    // Divide em no máximo 2 partes usando '-':
+    // "10-30" -> ["10", "30"]
+    // "10-"   -> ["10", ""]
+    // "-30"   -> ["", "30"]
     var split = raw.Split('-', 2);
-    double? start = split[0].Length == 0 ? null : double.Parse(split[0], System.Globalization.CultureInfo.InvariantCulture);
-    double? stop  = split[1].Length == 0 ? null : double.Parse(split[1], System.Globalization.CultureInfo.InvariantCulture);
+
+    // Se o início vier vazio, vira null; senão converte para double.
+    // InvariantCulture evita erro com vírgula/ponto dependendo da localidade.
+    double? start = split[0].Length == 0
+        ? null
+        : double.Parse(split[0], System.Globalization.CultureInfo.InvariantCulture);
+
+    // Mesmo raciocínio para o fim da faixa.
+    double? stop = split[1].Length == 0
+        ? null
+        : double.Parse(split[1], System.Globalization.CultureInfo.InvariantCulture);
+
+    // Retorna o intervalo NPT normalizado.
     return new NptRange(start, stop);
 }
 ```
