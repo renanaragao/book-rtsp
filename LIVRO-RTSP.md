@@ -284,43 +284,95 @@ static NptRange ParseNpt(string rangeValue)
 
 ## 4) Modelo de mensagem RTSP (RFC §5-§9)
 
-RTSP define:
+RTSP define uma gramática de mensagem bem rígida.  
+Na prática, toda implementação precisa dominar 4 peças:
 
-- tipos de mensagem (requisição, resposta, mensagens específicas);
-- cabeçalhos gerais e por método;
-- corpo de mensagem e comprimento;
-- linha de requisição e status line.
+1. **Request-Line** (método, URI, versão), ex.: `PLAY rtsp://... RTSP/2.0`;
+2. **Headers** (metadados como `CSeq`, `Session`, `Range`);
+3. **Linha em branco** separando cabeçalhos do corpo;
+4. **Body** opcional (com `Content-Length` consistente).
 
-### Snippet C#: builder de requisição RTSP
+### 4.1 Requisição RTSP: estrutura mínima
+
+Exemplo mental:
+
+```text
+PLAY rtsp://example.com/media RTSP/2.0
+CSeq: 42
+Session: abcd1234
+Range: npt=10-20
+
+```
+
+Se houver corpo, ele vem após a linha em branco e deve bater com `Content-Length`.
+
+### Snippet C#: builder de requisição RTSP (linha por linha)
 
 ```csharp
+// Necessário para StringBuilder e Encoding.
 using System.Text;
 
+// Monta uma requisição RTSP completa em formato texto.
+// method: PLAY/PAUSE/SETUP...
+// uri: recurso RTSP alvo
+// cseq: número sequencial da requisição
+// headers: cabeçalhos extras opcionais
+// body: corpo opcional
 static string BuildRequest(string method, string uri, int cseq, IDictionary<string, string>? headers = null, string? body = null)
 {
+    // Buffer eficiente para construir string em múltiplas etapas.
     var sb = new StringBuilder();
+
+    // Primeira linha obrigatória da requisição RTSP.
     sb.AppendLine($"{method} {uri} RTSP/2.0");
+
+    // Header obrigatório para correlação de mensagens.
     sb.AppendLine($"CSeq: {cseq}");
 
+    // Se houver cabeçalhos adicionais, escreve um por linha.
     if (headers is not null)
         foreach (var (k, v) in headers)
             sb.AppendLine($"{k}: {v}");
 
+    // Se houver corpo, calcula o tamanho em bytes UTF-8 e envia Content-Length.
     if (!string.IsNullOrEmpty(body))
         sb.AppendLine($"Content-Length: {Encoding.UTF8.GetByteCount(body)}");
 
+    // Linha em branco obrigatória: separa cabeçalhos do corpo.
     sb.AppendLine();
+
+    // Escreve o corpo somente quando existe.
     if (!string.IsNullOrEmpty(body)) sb.Append(body);
+
+    // Converte o buffer inteiro em string final da mensagem.
     return sb.ToString();
 }
 ```
 
-### Snippet C#: leitura de status line
+### 4.2 Resposta RTSP: leitura da Status-Line
+
+A primeira linha da resposta normalmente é algo como:
+
+```text
+RTSP/2.0 200 OK
+```
+
+Para lógica de controle, o campo mais importante é o código numérico (`200`, `457`, `460`...).
+
+### Snippet C#: leitura de status line (linha por linha)
 
 ```csharp
+// Extrai o código de status da primeira linha da resposta RTSP.
+// Retorna -1 se a linha estiver inválida.
 static int ParseStatusCode(string statusLine)
 {
+    // Quebra por espaços, ignorando espaços duplicados.
+    // "RTSP/2.0 200 OK" -> ["RTSP/2.0", "200", "OK"]
     var parts = statusLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+    // Confere se existe pelo menos o segundo token (código),
+    // tenta converter para inteiro e retorna esse valor.
+    // Se falhar, retorna -1 para sinalizar parse inválido.
     return parts.Length >= 2 && int.TryParse(parts[1], out var code) ? code : -1;
 }
 ```
