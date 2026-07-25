@@ -67,6 +67,49 @@ Na prática:
 - **SHOULD**: fortemente recomendado; desvio exige justificativa
 - **MAY**: opcional
 
+### 2.1 Como interpretar linguagem normativa na implementação
+
+Ao ler uma regra da RFC, transforme em decisão de código:
+
+1. se for **MUST**, trate violação como erro de protocolo;
+2. se for **SHOULD**, implemente como padrão e só desvie com motivo claro;
+3. se for **MAY**, trate como recurso opcional, idealmente com feature flag/capability.
+
+Exemplo mental:
+
+- "A request MUST include Session" -> valide e rejeite sem `Session` quando aplicável;
+- "Server SHOULD include Range" -> mantenha como padrão de resposta;
+- "Client MAY use pipelining" -> suporte opcional, sem quebrar operação básica.
+
+### 2.2 Terminologia essencial do RTSP
+
+- **RTSP Session**: contexto lógico de controle criado tipicamente no `SETUP`.
+- **Session ID**: identificador dessa sessão no header `Session`.
+- **CSeq**: número sequencial da requisição para correlação de resposta.
+- **Control URI**: URI RTSP alvo da operação (mídia individual ou agregado).
+- **Aggregated Control**: controle de múltiplas mídias como uma única sessão lógica.
+- **Range**: intervalo temporal da reprodução (`npt`, `clock`, etc.).
+- **NPT (Normal Play Time)**: tempo relativo da mídia (ex.: `npt=10-30`).
+- **Ready state**: sessão preparada para tocar, ainda sem envio ativo.
+- **Play state**: sessão em envio ativo de mídia.
+- **Interleaved**: mídia encapsulada no mesmo canal RTSP (geralmente sobre TCP).
+
+### 2.3 Cliente, servidor e fluxo de responsabilidade
+
+- **Cliente RTSP** decide *o que quer fazer* (`PLAY`, `PAUSE`, `TEARDOWN`).
+- **Servidor RTSP** decide *como atende* dentro da RFC (ajuste de range, erro válido, timeout).
+- O contrato entre eles é baseado em:
+  - método + URI;
+  - cabeçalhos obrigatórios;
+  - estado atual da sessão.
+
+### 2.4 Erros de terminologia que causam bugs
+
+1. Confundir RTSP com transporte de mídia: RTSP controla, RTP/RTCP costuma transportar.
+2. Tratar `Session` como conexão TCP: sessão lógica pode sobreviver a detalhes de conexão conforme implementação.
+3. Ignorar contexto de estado: método válido em `Ready` pode ser inválido em outro estado.
+4. Considerar `Range` como absoluto em todo cenário live: para live time-progressing, "agora" se move.
+
 ### Snippet C#: regra obrigatória com erro explícito
 
 ```csharp
