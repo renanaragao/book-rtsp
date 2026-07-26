@@ -399,6 +399,42 @@ Na prática, a sessão:
 2. associa recursos e parâmetros de transporte negociados;
 3. define janela de inatividade (`timeout`) para expiração.
 
+#### Sessão agregada vs sessão "normal" (não agregada)
+
+**Sessão agregada** é quando várias mídias/trilhas (ex.: áudio + vídeo) são controladas como um único conjunto lógico, por uma **URI de controle agregada**.
+
+**Sessão não agregada ("normal")** é quando o controle acontece por mídia/trilha individual, cada uma com seu contexto de controle direto na URI da trilha.
+
+Diferenças práticas:
+
+1. **Escopo do comando**
+   - Agregada: `PLAY/PAUSE/TEARDOWN` no controle agregado afeta o conjunto inteiro.
+   - Não agregada: o comando afeta apenas a trilha alvo.
+2. **URI usada**
+   - Agregada: use a URI agregada para operações agregadas.
+   - Não agregada: use a URI da mídia/trilha.
+3. **Erros de operação**
+   - Em sessão agregada, tentar operar uma única trilha com método que exige agregado pode gerar `460 Only Aggregate Operation Allowed`.
+4. **Sincronização**
+   - Agregada facilita manter áudio e vídeo sincronizados sob um único comando de controle.
+
+**Exemplo mental (agregada):**
+
+- Recurso: filme com duas trilhas (`audio` e `video`), com URI agregada `rtsp://exemplo.com/filme`.
+- Cliente envia `PLAY rtsp://exemplo.com/filme RTSP/2.0`.
+- Resultado: áudio e vídeo iniciam juntos sob o mesmo contexto.
+- Cliente envia `PAUSE rtsp://exemplo.com/filme RTSP/2.0`.
+- Resultado: as duas trilhas pausam juntas.
+
+**Exemplo mental (não agregada):**
+
+- Recurso: mesmas trilhas, mas controle por URI individual:
+  - `rtsp://exemplo.com/filme/audio`
+  - `rtsp://exemplo.com/filme/video`
+- Cliente envia `PAUSE` apenas para `.../audio`.
+- Resultado: somente o áudio pausa; vídeo pode continuar (dependendo da política da aplicação).
+- Para pausar tudo, o cliente precisa enviar comando para cada trilha relevante.
+
 Regras práticas:
 
 - se uma requisição de controle exigir sessão e vier sem `Session`, espere erro;
