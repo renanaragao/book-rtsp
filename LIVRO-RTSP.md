@@ -443,25 +443,61 @@ Regras práticas:
 
 ### 5.2 Como funciona o CSeq
 
-`CSeq` é o número sequencial da requisição RTSP e é obrigatório para correlação de mensagens.
+`CSeq` (**Command Sequence**) é o contador de requisições RTSP dentro da conexão de controle.  
+Ele existe para o cliente e o servidor saberem exatamente **qual resposta pertence a qual requisição**.
 
 Boas práticas de implementação:
 
 1. incrementa 1 por requisição enviada na conexão;
 2. resposta deve retornar o mesmo `CSeq` da requisição correspondente;
 3. em pipelining, `CSeq` evita ambiguidade quando várias respostas chegam em sequência.
+4. se o `CSeq` da resposta não bater, trate como erro de protocolo/correlação.
 
-### Snippet C#: gerador de CSeq thread-safe
+Exemplo mental rápido:
+
+1. cliente envia `PLAY` com `CSeq: 41`;
+2. cliente envia `PAUSE` com `CSeq: 42` (pipelining ou logo em seguida);
+3. servidor responde fora de ordem por latência;
+4. o cliente usa o `CSeq` para ligar cada resposta ao request certo.
+
+### Snippet C#: gerador de CSeq thread-safe (linha por linha)
 
 ```csharp
+// Traz o tipo Interlocked para incremento atômico.
 using System.Threading;
 
+// Classe fechada para gerar CSeq sem herança.
 public sealed class CSeqGenerator
 {
+    // Campo interno que guarda o último CSeq emitido.
     private int _value;
 
+    // Permite iniciar contador de um valor conhecido (default 0).
     public CSeqGenerator(int startAt = 0) => _value = startAt;
+
+    // Incrementa de forma atômica e retorna o novo valor.
+    // "atômico" evita duplicidade quando múltiplas threads enviam requests.
     public int Next() => Interlocked.Increment(ref _value);
+}
+```
+
+### Snippet C#: validando CSeq da resposta (linha por linha)
+
+```csharp
+// Verifica se a resposta pertence à requisição esperada.
+// Retorna true quando bate; false quando houver mismatch.
+static bool IsExpectedCSeq(IReadOnlyDictionary<string, string> responseHeaders, int expectedCSeq)
+{
+    // Tenta ler o header "CSeq" da resposta.
+    if (!responseHeaders.TryGetValue("CSeq", out var cseqRaw))
+        return false; // Sem CSeq: não dá para correlacionar com segurança.
+
+    // Converte o CSeq recebido para inteiro.
+    if (!int.TryParse(cseqRaw, out var receivedCSeq))
+        return false; // Valor inválido também é erro de protocolo.
+
+    // Confere igualdade entre recebido e esperado.
+    return receivedCSeq == expectedCSeq;
 }
 ```
 
