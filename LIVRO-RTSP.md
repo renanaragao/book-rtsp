@@ -534,12 +534,41 @@ Fluxo típico para live:
 4. `PAUSE`/`PLAY` para pausar e retomar (quando o tipo de mídia permitir);
 5. `TEARDOWN` para liberar recursos.
 
+#### Tipos de transporte no SETUP
+
+- **UDP unicast**: servidor envia RTP/RTCP para **um cliente específico** (IP/porta daquele cliente).  
+  É comum em cenários 1:1 e costuma ter baixa latência.
+
+- **UDP multicast**: servidor envia um único fluxo para um **grupo multicast**, e vários clientes recebem ao mesmo tempo.  
+  É eficiente para 1:n, mas depende de suporte de rede (roteamento/switches/políticas).
+
+- **Interleaved TCP**: RTP/RTCP vai encapsulado no **mesmo canal TCP do RTSP** (frames interleaved, `$`).  
+  Controle e mídia passam pela mesma conexão.
+
+**Quando cada um leva vantagem:**
+
+1. **UDP unicast**  
+   Vantagem quando você quer baixa latência por cliente e tem controle de rede/portas.  
+   Bom para sessões individuais (1:1), especialmente em LAN ou ambientes administrados.
+
+2. **UDP multicast**  
+   Vantagem quando muitos clientes precisam do **mesmo stream ao mesmo tempo** (1:n).  
+   Reduz tráfego e CPU no servidor, porque um único fluxo atende vários receptores.
+
+3. **Interleaved TCP**  
+   Vantagem quando há NAT/firewall restritivo, rede corporativa rígida ou falha recorrente em UDP.  
+   Simplifica conectividade por usar uma única conexão TCP RTSP já permitida.
+
 Pontos importantes da RFC para live:
 
 - para conteúdo time-progressing, o ponto "agora" é dinâmico;
 - após pausa em alguns cenários live, retomar pode exigir `Range: npt=now-`;
 - em redes restritas por NAT/firewall, interleaved no canal RTSP pode simplificar conectividade;
 - sincronização de mídia normalmente depende de informações como `RTP-Info` e relógio RTP/NPT.
+
+**Por que interleaved ajuda com NAT/firewall:**  
+em UDP unicast/multicast, além da conexão de controle RTSP, a rede precisa liberar portas UDP extras para RTP/RTCP (e manter mapeamentos NAT ativos). Em muitos ambientes corporativos isso é bloqueado ou instável.  
+Com interleaved TCP, tudo passa pela conexão RTSP já estabelecida (normalmente uma porta TCP permitida), reduzindo regras de firewall e problemas de mapeamento NAT.
 
 ### Snippet C#: escolhendo transporte para live
 
