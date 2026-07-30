@@ -1198,11 +1198,29 @@ void ConsumeIncomingBuffer(List<byte> buffer)
 
 ## 9) Proxies (RFC §15)
 
-Proxies precisam:
+Proxies RTSP ficam no meio entre cliente e servidor e precisam preservar a semântica do protocolo
+em cada hop, sem "quebrar" estado de sessão, capacidades e transporte.
 
-- encaminhar mensagens preservando semântica;
-- lidar com extensões/capabilities;
-- multiplexar e demultiplexar corretamente.
+Papéis típicos de um proxy:
+
+1. roteamento para upstream correto (sharding/região/política);
+2. controle de acesso/autenticação no edge;
+3. observabilidade e limitação de tráfego;
+4. normalização mínima de mensagens para interoperabilidade.
+
+Responsabilidades de interoperabilidade:
+
+1. preservar correlação de mensagens (`CSeq`, `Session`) e ordem lógica por conexão;
+2. encaminhar/negociar extensões com `Supported`, `Require`, `Proxy-Supported` e `Proxy-Require`;
+3. tratar corretamente `REDIRECT`, `PLAY_NOTIFY` e outros métodos menos comuns;
+4. em modo interleaved, demultiplexar/remultiplexar sem corromper framing binário.
+
+Cuidados práticos:
+
+- manter timeout e lifecycle de sessão coerentes entre os dois lados;
+- evitar reescrever headers sem necessidade;
+- registrar decisões de roteamento para diagnóstico;
+- aplicar limites de tamanho/taxa para proteger upstream.
 
 ### Snippet C#: exemplo simplificado de roteamento por URI
 
@@ -1211,6 +1229,29 @@ static string PickUpstream(Uri requestUri) =>
     requestUri.Host.EndsWith(".interna.example", StringComparison.OrdinalIgnoreCase)
         ? "rtsp://upstream-a.internal"
         : "rtsp://upstream-b.internal";
+```
+
+### Snippet C#: preservando headers críticos ao encaminhar
+
+```csharp
+// Headers que o proxy não deve perder durante o forward.
+static readonly string[] CriticalHeaders =
+{
+    "CSeq", "Session", "Transport", "Range", "Require", "Supported",
+    "Proxy-Require", "Proxy-Supported"
+};
+
+// Copia headers relevantes para o request de upstream.
+static Dictionary<string, string> BuildForwardHeaders(IReadOnlyDictionary<string, string> incoming)
+{
+    var forwarded = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var name in CriticalHeaders)
+        if (incoming.TryGetValue(name, out var value))
+            forwarded[name] = value;
+
+    return forwarded;
+}
 ```
 
 ---
@@ -1303,7 +1344,48 @@ static Dictionary<string, string> ParseHeaders(IEnumerable<string> lines)
 
 ### 13.1 ABNF e conformidade sintática
 
-Para interoperabilidade, o parser deve ser estrito no núcleo sintático e tolerante somente onde a RFC permitir.
+Para interoperabilidade real, ABNF não é detalhe: é o contrato que impede ambiguidades entre
+implementações de cliente, servidor e proxy.
+
+Diretriz prática: seja **estrito no que valida** e **explícito no erro**.
+Aceitar mensagens malformadas "porque funciona" costuma gerar bugs difíceis de reproduzir.
+
+Pontos que o parser deve validar sempre:
+
+1. **Start-Line** válida (`Request-Line` ou `Status-Line`) com versão RTSP coerente.
+2. **Headers** no formato `Nome: valor`, com término de linha correto.
+3. **Content-Length** consistente com o corpo recebido (nem truncado, nem bytes sobrando).
+4. **CSeq** presente e numérico em mensagens que exigem correlação.
+5. **Session** quando o método/estado exigir contexto de sessão.
+
+Onde ser tolerante (com cuidado):
+
+- ordem dos headers;
+- capitalização de nomes de headers (case-insensitive);
+- espaços extras onde a gramática permitir.
+
+Quando rejeitar:
+
+- linha inicial inválida;
+- header sem `:`;
+- `Content-Length` inválido;
+- campos críticos fora de política/estado.
+
+Retorne código de erro compatível (por exemplo `400`, `451`, `455`, `456`, `457`) em vez de
+"corrigir silenciosamente" entrada inválida.
+
+### Snippet C#: validação mínima de Start-Line RTSP
+
+```csharp
+// Verifica se é uma Status-Line RTSP/2.0 com código numérico.
+static bool IsValidStatusLine(string line)
+{
+    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    return parts.Length >= 3 &&
+           parts[0].Equals("RTSP/2.0", StringComparison.Ordinal) &&
+           int.TryParse(parts[1], out _);
+}
+```
 
 ### 13.2 Considerações de segurança
 
@@ -1313,6 +1395,23 @@ Boas práticas:
 2. limitar recursos por sessão/conexão;
 3. tratar redirecionamento com política explícita;
 4. evitar parsing permissivo para campos críticos.
+
+A superfície de ataque em RTSP aparece em três frentes:
+
+1. **entrada malformada** (flood, header/body gigante, framing inconsistente);
+2. **transição de estado indevida** (`PLAY`/`PAUSE`/`TEARDOWN` fora do estado esperado);
+3. **controle de rota/sessão** (abuso de `REDIRECT`, sequestro de `Session`, replay de requests).
+
+Controles recomendados em produção:
+
+- limite por conexão (mensagens/s, bytes/s, requests pendentes);
+- timeout de leitura/escrita e timeout de sessão inativa;
+- validação de destino em `REDIRECT` (allowlist de host/esquema/porta);
+- logging estruturado com `CSeq`, `Session`, método e status para auditoria;
+- descarte explícito de mensagens que violem framing interleaved (`$`, canal, length).
+
+Em `GET_PARAMETER`/`SET_PARAMETER`, trate payload como entrada não confiável:
+valide nomes permitidos, tipos e faixas; rejeite parâmetros desconhecidos com erro explícito.
 
 ### Snippet C#: guarda contra mensagens excessivas
 
