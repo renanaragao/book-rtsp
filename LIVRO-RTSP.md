@@ -588,7 +588,40 @@ static string ChooseLiveTransport(bool preferTcpInterleaved, int rtpPort = 5000,
 
 ### 6.1 Capability handling
 
-Use `OPTIONS` e cabeçalhos de feature para descobrir extensões suportadas.
+Capability handling é a negociação explícita do que cliente e servidor realmente suportam.
+Sem isso, o cliente pode enviar métodos/headers opcionais e receber falhas de interoperabilidade.
+
+**Cabeçalhos-chave nessa negociação:**
+
+- `Public`: lista de métodos aceitos pelo recurso/servidor (`OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, etc.).
+- `Supported`: lista de extensões/feature-tags que a outra ponta entende.
+- `Require`: extensões obrigatórias para processar aquela requisição.
+- `Proxy-Require`: semelhante ao `Require`, mas exigindo suporte também no caminho por proxies RTSP.
+
+Fluxo prático recomendado:
+
+1. Envie `OPTIONS` no início da sessão (ou quando mudar de recurso).
+2. Leia `Public` para saber quais métodos são válidos antes de montar o fluxo.
+3. Se uma funcionalidade for opcional, ative apenas quando aparecer em `Supported`.
+4. Use `Require` só quando a operação depender daquela extensão (caso contrário, prefira fallback).
+
+Se o servidor não suportar uma extensão exigida, a resposta tende a sinalizar erro de capability
+(por exemplo, com indicação de recurso não suportado). Nesses casos, o cliente robusto deve
+rebaixar a estratégia (fallback) ou ajustar o fluxo de métodos.
+
+### Snippet C#: checando capacidades antes de habilitar uma feature
+
+```csharp
+static bool SupportsFeature(string? supportedHeader, string featureTag)
+{
+    if (string.IsNullOrWhiteSpace(supportedHeader))
+        return false;
+
+    return supportedHeader
+        .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+        .Any(tag => string.Equals(tag, featureTag, StringComparison.OrdinalIgnoreCase));
+}
+```
 
 ### 6.2 Pipelining
 
