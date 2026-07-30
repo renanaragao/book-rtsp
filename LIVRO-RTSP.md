@@ -625,19 +625,65 @@ static bool SupportsFeature(string? supportedHeader, string featureTag)
 
 ### 6.2 Pipelining
 
-Permite enviar múltiplas requisições sem aguardar resposta individual imediata, respeitando correlação por `CSeq`.
+Pipelining permite enviar várias requisições RTSP na mesma conexão sem esperar a resposta de cada uma.
+O ganho principal é reduzir latência de ida-e-volta (RTT), especialmente quando você faz sequências como
+`OPTIONS` -> `DESCRIBE` -> múltiplos `SETUP`.
+
+Em cliente real, três regras evitam bugs:
+
+1. Cada requisição deve ter `CSeq` único e monotônico por conexão.
+2. Toda resposta deve ser correlacionada pelo `CSeq`, nunca por "ordem esperada" no código de negócio.
+3. Cada requisição pendente precisa de timeout/cancelamento para não vazar recursos.
+
+Quando usar:
+- links de alta latência (WAN, internet pública, VPN);
+- sequência de inicialização com várias chamadas curtas.
+
+Quando ter cuidado:
+- operações com forte dependência de estado do servidor (ex.: enviar `PLAY` antes de confirmar `SETUP`);
+- servidores legados que anunciam suporte parcial e se comportam mal com muitas pendências.
 
 ### Snippet C#: correlacionando respostas por CSeq
 
 ```csharp
+// Guarda, por CSeq, a promessa da resposta pendente.
 var pending = new Dictionary<int, TaskCompletionSource<string>>();
 
+// Registra a requisição enviada para correlação futura.
 void Register(int cseq, TaskCompletionSource<string> tcs) => pending[cseq] = tcs;
 
+// Chamado quando uma resposta RTSP completa chega do socket/parser.
 void OnResponseReceived(int cseq, string rawResponse)
 {
+    // Remove e recupera a pendência em um único passo (evita dupla conclusão).
     if (pending.Remove(cseq, out var tcs))
+        // Conclui a Task de quem enviou a requisição correspondente.
         tcs.TrySetResult(rawResponse);
+}
+```
+
+### Snippet C#: enviando requisição pipelined com `CSeq` incremental
+
+```csharp
+// Contador de CSeq por conexão RTSP.
+int _nextCSeq = 0;
+
+// Envia request sem bloquear a conexão e devolve Task da resposta correlacionada.
+Task<string> SendPipelinedAsync(string method, string uri)
+{
+    // Gera CSeq único de forma atômica (thread-safe).
+    var cseq = Interlocked.Increment(ref _nextCSeq);
+    // Promessa da resposta; continuações assíncronas evitam bloquear I/O.
+    var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Registra antes de enviar para não perder resposta que chegue muito rápido.
+    Register(cseq, tcs);
+
+    // Monta a mensagem RTSP com method/uri/CSeq.
+    var request = BuildRequest(method, uri, cseq);
+    // Escreve no socket da conexão atual.
+    socket.Send(request);
+    // Quem chamou aguarda esta Task até a resposta do mesmo CSeq.
+    return tcs.Task;
 }
 ```
 
@@ -645,7 +691,22 @@ void OnResponseReceived(int cseq, string rawResponse)
 
 ## 7) Métodos RTSP (RFC §13)
 
-Este é o núcleo operacional do protocolo.
+Este é o núcleo operacional do protocolo: os métodos definem **o ciclo de vida da sessão**,
+da descoberta de capacidades até o encerramento.
+
+Em implementação prática, pense nesses métodos em três blocos:
+
+1. **Descoberta e preparação**: `OPTIONS` e `DESCRIBE`.
+2. **Negociação e execução**: `SETUP`, `PLAY`, `PAUSE`.
+3. **Operação e encerramento**: `GET_PARAMETER`, `SET_PARAMETER`, `TEARDOWN`, `REDIRECT`.
+
+Uma sessão robusta normalmente segue a ordem:
+`OPTIONS` -> `DESCRIBE` -> `SETUP` (por trilha) -> `PLAY` -> (`PAUSE`/`PLAY` conforme necessário) -> `TEARDOWN`.
+
+Dois princípios evitam grande parte dos erros:
+
+- sempre correlacionar request/response por `CSeq` e validar `Session` quando aplicável;
+- tratar métodos como transições de estado (por exemplo, `PLAY` antes de `SETUP` tende a falhar).
 
 ### 7.1 OPTIONS (§13.1)
 
@@ -653,7 +714,28 @@ Este é o núcleo operacional do protocolo.
 **Quando usar:** início da sessão e diagnóstico de interoperabilidade.  
 **Esperado na resposta:** `Public` com lista de métodos (e possivelmente indicações de features).
 
+`OPTIONS` é o ponto de entrada mais seguro para adaptar o cliente ao servidor real, em vez de
+assumir suporte universal. Ele permite responder perguntas como:
+
+- este endpoint aceita `GET_PARAMETER`/`SET_PARAMETER`?
+- há suporte a extensões anunciadas por `Supported`?
+- o método está disponível no recurso agregado, na trilha, ou em ambos?
+
+Boas práticas para `OPTIONS`:
+
+1. Enviar no URI agregado no início da sessão.
+2. Repetir em URI de trilha quando houver dúvida de suporte por recurso.
+3. Usar o resultado para habilitar/desabilitar fluxos opcionais do cliente.
+4. Em ausência de `Public`, operar com fallback conservador e log explícito.
+
+Erros típicos:
+
+- assumir que todo servidor suporta todos os métodos da RFC;
+- ignorar diferença entre capacidade global do servidor e capacidade por recurso específico;
+- não ajustar o fluxo quando uma feature opcional não aparece nos headers de capability.
+
 ```csharp
+// Monta um OPTIONS para descobrir métodos/capacidades do recurso.
 var options = BuildRequest("OPTIONS", "rtsp://example.com/media", 1);
 ```
 
@@ -663,6 +745,17 @@ var options = BuildRequest("OPTIONS", "rtsp://example.com/media", 1);
 **Quando usar:** antes de `SETUP`, para saber trilhas e URIs de controle.  
 **Cabeçalhos importantes:** `Accept` (ex.: `application/sdp`).  
 **Erros comuns:** tipo de descrição não suportado.
+
+`DESCRIBE` é onde o cliente descobre a topologia real da mídia: quais trilhas existem,
+quais codecs/formats são anunciados e quais URIs de controle devem ser usadas depois.
+Em prática, quase toda decisão de `SETUP` nasce da leitura correta desse payload.
+
+Boas práticas:
+
+1. Sempre enviar `Accept` explícito para evitar ambiguidade de formato de descrição.
+2. Validar se o payload retornado contém trilhas coerentes com o que o app espera (áudio/vídeo).
+3. Diferenciar URI agregada da sessão e URIs de trilha para não enviar `SETUP` no alvo errado.
+4. Falhar cedo quando descrição vier incompleta, em vez de seguir para `SETUP` inconsistente.
 
 ```csharp
 var describe = BuildRequest("DESCRIBE", "rtsp://example.com/media", 2,
@@ -675,6 +768,17 @@ var describe = BuildRequest("DESCRIBE", "rtsp://example.com/media", 2,
 **Quando usar:** após `DESCRIBE`, para cada mídia/trilha necessária.  
 **Cabeçalhos importantes:** `Transport`, `Accept-Ranges`.  
 **Esperado na resposta:** `Session`, `Transport` selecionado, além de cabeçalhos de capacidades temporais.
+
+`SETUP` é o método que transforma "descrição" em "sessão ativa". Em sessões com múltiplas trilhas,
+o cliente executa um `SETUP` por trilha; normalmente a primeira resposta cria a `Session` e as próximas
+associam novas trilhas ao mesmo identificador.
+
+Pontos críticos de interoperabilidade:
+
+1. O `Transport` enviado é uma proposta; o servidor pode ajustar parâmetros na resposta.
+2. O cliente deve consumir o `Transport` efetivo retornado (portas/canais realmente aceitos).
+3. Quando UDP falhar por rede restrita, fallback para interleaved TCP costuma ser o caminho robusto.
+4. Sem `Session` válida, não prossiga para `PLAY`.
 
 ```csharp
 var setup = BuildRequest("SETUP", "rtsp://example.com/media/track1", 3,
@@ -693,6 +797,36 @@ var setup = BuildRequest("SETUP", "rtsp://example.com/media/track1", 3,
 **Esperado na resposta:** `Range` efetivo (ajustado pelo servidor), e possivelmente `RTP-Info`.  
 **Erro clássico:** `457 Invalid Range` quando início/fim pedido é inválido.
 
+`PLAY` comanda o ponto temporal e o início efetivo de entrega. Sem `Range`, o servidor tende a aplicar
+comportamento padrão do recurso (início natural, ou "agora" em cenários live). Com `Range`, o cliente
+pede recorte temporal explícito, e o servidor pode ajustar esse recorte para limites válidos.
+
+Checklist prático antes de enviar:
+
+1. Confirmar `Session` ativa.
+2. Confirmar que todas as trilhas necessárias já passaram por `SETUP`.
+3. Definir estratégia de seek (`Seek-Style`) quando precisão temporal for relevante.
+4. Tratar `RTP-Info` da resposta para sincronização inicial de decodificação.
+
+**O que é `Seek-Style`:**  
+é o header usado no `PLAY` (com `Range`) para expressar **como** o servidor deve escolher
+o ponto real de início quando há acesso aleatório (random access) na mídia.
+
+Políticas definidas na RFC:
+
+1. `RAP` (Random Access Point): inicia no RAP anterior mais próximo do ponto pedido.  
+   Melhor qualidade de decodificação inicial, pois começa em ponto seguro de referência.
+2. `CoRAP` (Conditional RAP): usa RAP **se** ele estiver mais próximo do alvo do que do pause point atual;  
+   caso contrário continua do pause point (na prática, pode virar comportamento `Next` na resposta).
+3. `First-Prior`: inicia na primeira unidade de mídia imediatamente anterior ao tempo pedido.
+4. `Next`: inicia na primeira unidade **após** o tempo pedido (útil para continuar sem sobreposição grande).
+
+Notas de interoperabilidade:
+
+- para mídias com propriedades de random access, o servidor deve retornar o `Seek-Style` aplicado na resposta `PLAY`;
+- se cliente/servidor receber política desconhecida, deve ignorar e seguir com fallback padrão;
+- `Next` só deve ser usado por solicitação explícita do cliente.
+
 ```csharp
 var play = BuildRequest("PLAY", "rtsp://example.com/media", 4,
     new Dictionary<string, string>
@@ -709,9 +843,54 @@ var play = BuildRequest("PLAY", "rtsp://example.com/media", 4,
 (fim de stream, atualização de propriedades de mídia, troca de escala etc.).  
 **Quando usar:** não é enviado pelo cliente; o cliente precisa saber consumir/tratar.
 
+`PLAY_NOTIFY` fecha uma lacuna importante: nem todo evento relevante cabe no fluxo estritamente
+request/response iniciado pelo cliente. O servidor pode avisar mudanças de estado da reprodução
+sem esperar polling ativo.
+
+**Como a notificação chega no cliente (ponto que costuma confundir):**
+
+- em RTSP 2.0, a conexão de controle é **bidirecional**;
+- isso significa que, na mesma conexão TCP já aberta pelo cliente, o servidor pode enviar requests RTSP;
+- `PLAY_NOTIFY` é justamente um desses requests servidor->cliente.
+
+Na prática, o cliente mantém **uma** conexão RTSP de controle e um loop de leitura que aceita dois tipos
+de mensagem de entrada:
+
+1. respostas às requisições que o cliente enviou (`CSeq` correlacionado);
+2. requisições iniciadas pelo servidor (como `PLAY_NOTIFY`), que o cliente deve processar e responder.
+
+Então, para `PLAY_NOTIFY`, **não é obrigatório abrir uma segunda conexão TCP** só para notificação.
+O que muda é a lógica do parser/dispatcher do cliente: ele não pode assumir que toda mensagem recebida
+é resposta.  
+
+Observação: o transporte de mídia (RTP/RTCP) continua independente dessa regra e pode ser UDP ou
+interleaved no mesmo TCP RTSP. Isso não altera o fato de que o `PLAY_NOTIFY` chega pelo canal de
+controle RTSP.
+
+Boas práticas de tratamento:
+
+1. Processar de forma assíncrona, sem bloquear o loop de I/O principal.
+2. Correlacionar com a sessão/trilha correta antes de atualizar estado local.
+3. Tornar o tratamento idempotente, porque notificações podem repetir em cenários reais.
+4. Registrar telemetria para diagnóstico de fim de stream e mudanças inesperadas.
+
 ```csharp
-static bool IsPlayNotify(string method) =>
-    method.Equals("PLAY_NOTIFY", StringComparison.OrdinalIgnoreCase);
+// Diferencia rapidamente se a mensagem recebida é request RTSP (ex.: PLAY_NOTIFY).
+static bool IsServerRequest(string startLine) =>
+    !startLine.StartsWith("RTSP/2.0 ", StringComparison.Ordinal);
+
+// Trata requests vindos do servidor no mesmo canal de controle.
+void OnServerRequestReceived(RtspRequest req)
+{
+    if (req.Method.Equals("PLAY_NOTIFY", StringComparison.OrdinalIgnoreCase))
+    {
+        HandlePlayNotify(req.Headers, req.Body);  // Atualiza estado local do player.
+        SendResponse(req.CSeq, 200, "OK");        // Cliente responde ao request do servidor.
+        return;
+    }
+
+    SendResponse(req.CSeq, 405, "Method Not Allowed");
+}
 ```
 
 ### 7.6 PAUSE (§13.6)
@@ -720,6 +899,16 @@ static bool IsPlayNotify(string method) =>
 **Quando usar:** sessão em `Play` (e idempotência prática em certos cenários já em `Ready`).  
 **Esperado na resposta:** `Range` com ponto atual/trecho remanescente.  
 **Atenção live:** para mídia time-progressing sem retenção, retomada pode exigir `npt=now-`.
+
+`PAUSE` preserva contexto de sessão sem liberar tudo como em `TEARDOWN`.
+Isso permite retomar rápido com `PLAY`, desde que o modelo temporal do conteúdo permita.
+
+Cuidados práticos:
+
+1. Persistir localmente o ponto de pausa retornado pelo servidor.
+2. Em live sem buffer de retenção, preparar fallback para retomada relativa ao "agora".
+3. Evitar assumir que `PAUSE` congela estado de rede/transporte por tempo indefinido.
+4. Se a pausa for longa, revalidar sessão/keepalive antes do `PLAY` de retomada.
 
 ```csharp
 var pause = BuildRequest("PAUSE", "rtsp://example.com/media", 5,
@@ -732,6 +921,16 @@ var pause = BuildRequest("PAUSE", "rtsp://example.com/media", 5,
 **Quando usar:** final de reprodução, troca de conteúdo, limpeza de sessão.  
 **Comportamento:** pode destruir sessão inteira ou remover mídia específica (dependendo de URI/estado e se sessão é agregada).
 
+`TEARDOWN` é o encerramento explícito do ciclo. Em produção, enviar esse método de forma previsível
+evita sessões órfãs no servidor e reduz consumo desnecessário de recursos.
+
+Regras práticas:
+
+1. Use URI agregada para encerrar sessão completa quando esse for o objetivo.
+2. Use URI de trilha apenas quando quiser remover mídia específica.
+3. Trate timeout/falha de rede com cleanup local mesmo sem resposta final.
+4. Após `TEARDOWN` bem-sucedido, invalide `Session` no cliente para impedir reuso acidental.
+
 ```csharp
 var teardown = BuildRequest("TEARDOWN", "rtsp://example.com/media", 6,
     new Dictionary<string, string> { ["Session"] = "abcd1234" });
@@ -742,10 +941,90 @@ var teardown = BuildRequest("TEARDOWN", "rtsp://example.com/media", 6,
 **Para que serve:** consultar parâmetros de sessão/recurso (estado, métricas etc.).  
 **Quando usar:** monitoramento, keepalive em implementações que adotam esse padrão, telemetria de sessão.
 
+`GET_PARAMETER` é útil para observabilidade e manutenção de sessão sem alterar estado de mídia.
+Dependendo do servidor, pode ser usado como heartbeat leve ou consulta de indicadores operacionais.
+
+**Canal de conexão (comparação com `PLAY_NOTIFY`):**
+
+- `GET_PARAMETER` usa o **mesmo canal TCP RTSP de controle** já aberto para `PLAY`/`PAUSE`/`TEARDOWN`.
+- Não exige segunda conexão TCP só para observabilidade.
+- Diferença principal:
+  - `GET_PARAMETER`: modelo **pull** (cliente solicita, servidor responde).
+  - `PLAY_NOTIFY`: modelo **push** (servidor inicia notificação assíncrona).
+
+**Valores/formatos possíveis no `GET_PARAMETER`:**
+
+1. **Sem parâmetros** (sem body e sem headers de consulta):  
+   serve como keepalive da sessão (se o servidor responder `200 OK`).
+2. **Via headers de consulta** (quando suportado pelo servidor):  
+   a RFC lista `Accept-Ranges`, `Media-Range`, `Media-Properties`, `Range` e `RTP-Info`.
+3. **Via body `text/parameters`** (mais comum e mais claro):  
+   cliente envia nomes de parâmetros e o servidor responde os mesmos nomes preenchidos com valor.
+
+Formato típico em body:
+
+- Requisição: uma linha por parâmetro (`jitter`, `packet_loss`, `packets_received` etc.).
+- Resposta: pares `nome: valor`.
+
+Se o media type do body não for suportado, o esperado é `415 Unsupported Media Type`.
+Se algum parâmetro não for entendido, o esperado é `451 Parameter Not Understood`.
+
+**Coisas interessantes para fazer com `GET_PARAMETER`:**
+
+1. **Telemetria de qualidade em tempo real**: consultar `jitter`, perda e pacotes recebidos para alimentar dashboard.
+2. **Adaptação de UX/rede**: se jitter/perda subir, reduzir resolução/bitrate no app ou trocar estratégia de transporte.
+3. **Detecção precoce de degradação**: acompanhar tendência antes de travar playback e atuar proativamente.
+4. **Health-check de sessão**: heartbeat periódico sem mexer no estado de reprodução.
+
+**Recuperação de observabilidade com `GET_PARAMETER` funciona assim:**
+
+1. Cliente envia `GET_PARAMETER` com `Session` e body `text/parameters` listando métricas (ex.: `jitter`, `packet_loss`, `packets_received`).
+2. Servidor responde `200 OK` no mesmo canal, com body contendo `nome: valor`.
+3. Cliente faz parse dos pares e publica em logs/métricas/dashboard.
+4. Repete em intervalo periódico (ex.: 1s, 2s, 5s), com timeout curto e backoff em falha.
+
+**Exemplo de payload:**
+
+**Request body**
+
+```text
+jitter
+packet_loss
+packets_received
+```
+
+**Response body**
+
+```text
+jitter: 0.38
+packet_loss: 0.02
+packets_received: 10234
+```
+
+Se o parâmetro não for suportado, o servidor pode responder `451 Parameter Not Understood`; se o tipo de body não for suportado, `415 Unsupported Media Type`.
+
+Boas práticas:
+
+1. Padronizar nomes de parâmetros consultados no cliente para facilitar compatibilidade.
+2. Tratar ausência de parâmetro como dado "não suportado", não como erro fatal automático.
+3. Separar chamadas de keepalive das chamadas de telemetria para controlar frequência.
+4. Aplicar timeout curto para não competir com métodos críticos (`PLAY`/`PAUSE`/`TEARDOWN`).
+
 ```csharp
+// Exemplo 1: consulta de métricas via body text/parameters.
 var getParameter = BuildRequest("GET_PARAMETER", "rtsp://example.com/media", 7,
-    new Dictionary<string, string> { ["Session"] = "abcd1234" },
+    new Dictionary<string, string>
+    {
+        ["Session"] = "abcd1234",
+        ["Content-Type"] = "text/parameters"
+    },
     body: "stream_state\r\njitter\r\npacket_loss\r\n");
+```
+
+```csharp
+// Exemplo 2: keepalive simples sem body (somente para renovar liveness da sessão).
+var keepAlive = BuildRequest("GET_PARAMETER", "rtsp://example.com/media", 8,
+    new Dictionary<string, string> { ["Session"] = "abcd1234" });
 ```
 
 ### 7.9 SET_PARAMETER (§13.9)
@@ -754,7 +1033,26 @@ var getParameter = BuildRequest("GET_PARAMETER", "rtsp://example.com/media", 7,
 **Quando usar:** ajustes em runtime (por exemplo volume, preferências de entrega, sinalizações de app).  
 **Atenção:** validar conteúdo e permissões para evitar inconsistência de estado.
 
+`SET_PARAMETER` é o canal de controle de propriedades dinâmicas sem renegociar toda a sessão.
+Ele é útil para comandos de aplicação, mas exige disciplina de validação para evitar estados parciais.
+
+Pontos de implementação:
+
+1. Definir contrato claro de payload (`Content-Type`, nomes, formato e faixas válidas).
+2. Rejeitar valores inválidos com erro explícito, sem aplicar atualização parcial silenciosa.
+3. Confirmar no cliente o estado aplicado (por resposta direta ou leitura posterior).
+4. Restringir parâmetros sensíveis por política/autorização.
+
+Exemplos práticos além de volume:
+
+1. alternar trilha de áudio/idioma durante reprodução;
+2. habilitar/desabilitar legenda;
+3. ajustar bitrate alvo em cenários adaptativos;
+4. sinalizar modo de latência (`low-latency`) para perfis de entrega;
+5. enviar metadados de aplicação (por exemplo, identificação de dispositivo/cliente).
+
 ```csharp
+// Exemplo 1: ajuste de volume.
 var setParameter = BuildRequest("SET_PARAMETER", "rtsp://example.com/media", 8,
     new Dictionary<string, string>
     {
@@ -764,11 +1062,54 @@ var setParameter = BuildRequest("SET_PARAMETER", "rtsp://example.com/media", 8,
     body: "volume: 0.6\r\n");
 ```
 
+```csharp
+// Exemplo 2: troca de trilha de áudio e idioma preferido.
+var setAudioTrack = BuildRequest("SET_PARAMETER", "rtsp://example.com/media", 9,
+    new Dictionary<string, string>
+    {
+        ["Session"] = "abcd1234",
+        ["Content-Type"] = "text/parameters"
+    },
+    body: "audio_track: 2\r\nlanguage: pt-BR\r\n");
+```
+
+```csharp
+// Exemplo 3: habilita legenda e seleciona trilha.
+var setSubtitle = BuildRequest("SET_PARAMETER", "rtsp://example.com/media", 10,
+    new Dictionary<string, string>
+    {
+        ["Session"] = "abcd1234",
+        ["Content-Type"] = "text/parameters"
+    },
+    body: "subtitle_enabled: true\r\nsubtitle_track: 1\r\n");
+```
+
+```csharp
+// Exemplo 4: ajuste de bitrate alvo e modo de baixa latência.
+var setAdaptiveProfile = BuildRequest("SET_PARAMETER", "rtsp://example.com/media", 11,
+    new Dictionary<string, string>
+    {
+        ["Session"] = "abcd1234",
+        ["Content-Type"] = "text/parameters"
+    },
+    body: "target_bitrate_kbps: 1800\r\nlow_latency: true\r\n");
+```
+
 ### 7.10 REDIRECT (§13.10)
 
 **Para que serve:** instruir o cliente a migrar para outro endpoint/URI.  
 **Quando usar:** manutenção, balanceamento, reorganização de serviço.  
 **Cabeçalho-chave:** `Location` com destino de redirecionamento.
+
+`REDIRECT` permite mover clientes de forma coordenada sem depender de falha abrupta.
+É comum em cenários de manutenção planejada, drenagem de nó ou rebalanceamento de carga.
+
+Fluxo recomendado no cliente:
+
+1. Validar `Location` recebido (formato, esquema e destino permitido pela política).
+2. Preparar nova conexão e repetir ciclo de setup no endpoint de destino.
+3. Trocar para novo fluxo de mídia com mínima interrupção possível.
+4. Encerrar sessão antiga com `TEARDOWN` quando a migração estiver estável.
 
 ```csharp
 static Uri ParseRedirectTarget(IReadOnlyDictionary<string, string> headers) =>
