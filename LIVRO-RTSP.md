@@ -1120,7 +1120,27 @@ static Uri ParseRedirectTarget(IReadOnlyDictionary<string, string> headers) =>
 
 ## 8) Dados binários interleaved (RFC §14)
 
-Quando RTP/RTCP é interleaved no mesmo canal RTSP, frames binários precisam de demultiplexação correta.
+Quando RTP/RTCP é interleaved no mesmo canal RTSP, frames binários e mensagens RTSP texto
+compartilham o mesmo stream TCP.  
+O cliente/servidor precisa demultiplexar corretamente para não confundir mídia com controle.
+
+Formato do frame interleaved:
+
+1. byte 0: marcador `$` (`0x24`);
+2. byte 1: canal (`channel id`);
+3. bytes 2-3: tamanho do payload em big-endian;
+4. bytes seguintes: payload RTP/RTCP com o tamanho informado.
+
+Exemplo: em `interleaved=0-1`, normalmente canal `0` carrega RTP e canal `1` carrega RTCP
+(a associação exata vem do `Transport` negociado no `SETUP`).
+
+Regras práticas de parsing:
+
+1. Se o próximo byte for `$`, leia exatamente 4 bytes de cabeçalho e depois `length` bytes de payload.
+2. Se não for `$`, trate como mensagem RTSP textual (`Request`/`Response`).
+3. Nunca assuma que um `recv()` devolve frame completo: acumule em buffer até completar.
+4. Valide limites de tamanho para evitar consumo excessivo de memória em payload malformado.
+5. Faça dispatch por canal para a pilha RTP/RTCP correta.
 
 ### Snippet C#: reconhecendo frame interleaved
 
@@ -1134,6 +1154,43 @@ static bool TryReadInterleavedHeader(ReadOnlySpan<byte> buf, out byte channel, o
     channel = buf[1];
     length = (ushort)((buf[2] << 8) | buf[3]);
     return true;
+}
+```
+
+### Snippet C#: demultiplexando RTSP texto x frame interleaved
+
+```csharp
+// Processa o buffer de entrada e separa mensagens RTSP de frames interleaved.
+void ConsumeIncomingBuffer(List<byte> buffer)
+{
+    while (buffer.Count > 0)
+    {
+        // Se não começar com '$', o próximo item é mensagem RTSP textual.
+        if (buffer[0] != (byte)'$')
+        {
+            if (!TryExtractRtspMessage(buffer, out var rawRtsp))
+                return; // Aguarda mais bytes para completar headers/body RTSP.
+
+            HandleRtspMessage(rawRtsp);
+            continue;
+        }
+
+        // Para frame interleaved, são necessários pelo menos 4 bytes de cabeçalho.
+        if (buffer.Count < 4) return;
+
+        var channel = buffer[1];
+        var length = (buffer[2] << 8) | buffer[3];
+        var total = 4 + length;
+
+        // Aguarda até ter o frame completo no buffer.
+        if (buffer.Count < total) return;
+
+        var payload = buffer.GetRange(4, length).ToArray();
+        buffer.RemoveRange(0, total);
+
+        // Encaminha por canal para a lógica RTP/RTCP correspondente.
+        HandleInterleavedFrame(channel, payload);
+    }
 }
 ```
 
